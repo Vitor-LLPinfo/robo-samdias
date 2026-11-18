@@ -1,0 +1,6 @@
+# Segredos e dados de execução (nunca versionar)
+config.json
+robo_log.csv
+robo_processados.json
+node_modules/
+.env

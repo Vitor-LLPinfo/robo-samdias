@@ -18,6 +18,7 @@ fi
 echo "[2/5] Criando /opt/robo-samdias..."
 sudo mkdir -p /opt/robo-samdias/templates
 sudo cp robo.js /opt/robo-samdias/
+[ -f config.json ] || cp config.example.json config.json
 sudo cp config.json /opt/robo-samdias/
 sudo cp templates/*.txt /opt/robo-samdias/templates/
 
