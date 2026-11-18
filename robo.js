@@ -5,13 +5,73 @@ const fs    = require('fs');
 const path  = require('path');
 
 const DIR    = __dirname;
-const CONFIG = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
+const CONFIG_FILE = path.join(DIR, 'config.json');
+const HAS_CONFIG_FILE = fs.existsSync(CONFIG_FILE);
+const CONFIG = loadConfig();
 const STATE_FILE = path.join(DIR, 'robo_processados.json');
 const LOG_FILE   = path.join(DIR, 'robo_log.csv');
 
+// RUN_ONCE=1 → executa um único ciclo e encerra (modo Container App Job).
+const RUN_ONCE = /^(1|true|sim)$/i.test(process.env.RUN_ONCE || '');
+// STATE_BLOB_URL → estado guardado num blob do Azure (identidade gerenciada) em vez de arquivo local.
+const STATE_BLOB_URL = process.env.STATE_BLOB_URL || '';
+
+// ---- Configuração: config.json (opcional) + variáveis de ambiente (têm prioridade) ----
+function loadConfig() {
+  const cfg = HAS_CONFIG_FILE ? JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) : {};
+  cfg.apresentame = cfg.apresentame || {};
+  cfg.clikchat = cfg.clikchat || {};
+  const env = process.env;
+  const str = v => (v === undefined || v === '') ? undefined : v;
+  const num = v => (v === undefined || v === '' || Number.isNaN(Number(v))) ? undefined : Number(v);
+  const set = (obj, key, val) => { if (val !== undefined) obj[key] = val; };
+
+  set(cfg.apresentame, 'baseUrl',         str(env.APRESENTAME_BASE_URL));
+  set(cfg.apresentame, 'email',           str(env.APRESENTAME_EMAIL));
+  set(cfg.apresentame, 'password',        str(env.APRESENTAME_PASSWORD));
+  set(cfg.apresentame, 'companyId',       num(env.APRESENTAME_COMPANY_ID));
+  set(cfg.apresentame, 'stepLead',        num(env.APRESENTAME_STEP_LEAD));
+  set(cfg.apresentame, 'stepFollowUp',    num(env.APRESENTAME_STEP_FOLLOWUP));
+  set(cfg.apresentame, 'stepAtendimento', num(env.APRESENTAME_STEP_ATENDIMENTO));
+  set(cfg.clikchat,    'email',           str(env.CLIKCHAT_EMAIL));
+  set(cfg.clikchat,    'password',        str(env.CLIKCHAT_PASSWORD));
+  set(cfg.clikchat,    'whatsappId',      num(env.CLIKCHAT_WHATSAPP_ID));
+  set(cfg, 'fusoHorario',      num(env.FUSO_HORARIO));
+  set(cfg, 'horarioInicio',    num(env.HORARIO_INICIO));
+  set(cfg, 'horarioFim',       num(env.HORARIO_FIM));
+  set(cfg, 'intervaloMinutos', num(env.INTERVALO_MINUTOS));
+
+  cfg.apresentame.baseUrl = cfg.apresentame.baseUrl || 'https://api.apresenta.me';
+  if (cfg.fusoHorario === undefined)      cfg.fusoHorario = -3;
+  if (cfg.horarioInicio === undefined)    cfg.horarioInicio = 8;
+  if (cfg.horarioFim === undefined)       cfg.horarioFim = 18;
+  if (cfg.intervaloMinutos === undefined) cfg.intervaloMinutos = 15;
+
+  const faltando = [
+    ['apresentame.email', cfg.apresentame.email], ['apresentame.password', cfg.apresentame.password],
+    ['apresentame.stepLead', cfg.apresentame.stepLead], ['apresentame.stepFollowUp', cfg.apresentame.stepFollowUp],
+    ['apresentame.stepAtendimento', cfg.apresentame.stepAtendimento],
+    ['clikchat.email', cfg.clikchat.email], ['clikchat.password', cfg.clikchat.password],
+    ['clikchat.whatsappId', cfg.clikchat.whatsappId]
+  ].filter(([, v]) => v === undefined || v === '').map(([k]) => k);
+  if (faltando.length) {
+    console.error('Configuração incompleta. Faltando: ' + faltando.join(', '));
+    process.exit(1);
+  }
+  return cfg;
+}
+
 // ---- Estado ----
 let state = {};
-function loadState() {
+let saveChain = Promise.resolve();
+
+async function loadState() {
+  if (STATE_BLOB_URL) {
+    // Falha ao ler o blob interrompe o ciclo: rodar sem estado reprocessaria leads.
+    state = (await blobGetJson())?.deals || {};
+    console.log(`[ESTADO] ${Object.keys(state).length} negócios carregados do Blob`);
+    return;
+  }
   try {
     if (fs.existsSync(STATE_FILE)) {
       const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
@@ -20,8 +80,44 @@ function loadState() {
   } catch(e) { console.error('Erro ao carregar estado:', e.message); }
 }
 function saveState() {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify({deals: state}, null, 2), 'utf8'); }
+  const json = JSON.stringify({deals: state}, null, 2);
+  if (STATE_BLOB_URL) {
+    saveChain = saveChain.then(() => blobPutJson(json))
+      .catch(e => console.error('Erro ao salvar estado no Blob:', e.message));
+    return;
+  }
+  try { fs.writeFileSync(STATE_FILE, json, 'utf8'); }
   catch(e) { console.error('Erro ao salvar estado:', e.message); }
+}
+
+// ---- Azure Blob via identidade gerenciada (Container Apps) ----
+let storageToken = null;
+let storageTokenExp = 0;
+async function getStorageToken() {
+  if (storageToken && Date.now() < storageTokenExp - 300000) return storageToken;
+  const {IDENTITY_ENDPOINT, IDENTITY_HEADER} = process.env;
+  if (!IDENTITY_ENDPOINT || !IDENTITY_HEADER) throw new Error('Identidade gerenciada indisponível (IDENTITY_ENDPOINT/IDENTITY_HEADER)');
+  const url = `${IDENTITY_ENDPOINT}?resource=${encodeURIComponent('https://storage.azure.com/')}&api-version=2019-08-01`;
+  const r = await request(url, {headers: {'X-IDENTITY-HEADER': IDENTITY_HEADER}});
+  if (r.status !== 200 || !r.data?.access_token) throw new Error(`Token de storage falhou (HTTP ${r.status})`);
+  storageToken = r.data.access_token;
+  storageTokenExp = Number(r.data.expires_on) * 1000 || Date.now() + 3600000;
+  return storageToken;
+}
+async function blobGetJson() {
+  const r = await request(STATE_BLOB_URL, {headers: {
+    Authorization: 'Bearer ' + await getStorageToken(), 'x-ms-version': '2021-08-06'
+  }});
+  if (r.status === 404) return null; // primeira execução
+  if (r.status !== 200) throw new Error(`Leitura do estado no Blob falhou (HTTP ${r.status})`);
+  return typeof r.data === 'string' ? JSON.parse(r.data || '{}') : r.data;
+}
+async function blobPutJson(json) {
+  const r = await request(STATE_BLOB_URL, {method: 'PUT', headers: {
+    Authorization: 'Bearer ' + await getStorageToken(), 'x-ms-version': '2021-08-06',
+    'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json; charset=utf-8'
+  }}, json);
+  if (r.status !== 201) throw new Error(`Gravação do estado no Blob falhou (HTTP ${r.status})`);
 }
 function log(dealId, name, phone, status, ticketId, erro) {
   const ts = new Date().toISOString().replace('T',' ').substring(0,19);
@@ -29,7 +125,9 @@ function log(dealId, name, phone, status, ticketId, erro) {
   try { fs.appendFileSync(LOG_FILE, linha + '\n', 'utf8'); } catch {}
   console.log(`[${ts}] ${status} | ${name} | ${phone}`);
 }
-if (!fs.existsSync(LOG_FILE)) fs.writeFileSync(LOG_FILE, 'timestamp,dealId,name,phone,status,ticketId,erro\n', 'utf8');
+try {
+  if (!fs.existsSync(LOG_FILE)) fs.writeFileSync(LOG_FILE, 'timestamp,dealId,name,phone,status,ticketId,erro\n', 'utf8');
+} catch(e) { console.error('Log CSV indisponível:', e.message); }
 
 // ---- Horário comercial (UTC-3 Brasília) ----
 function isHorarioComercial() {
@@ -49,16 +147,20 @@ function request(url, options = {}, body = null) {
       method: options.method || 'GET',
       headers: options.headers || {}
     };
+    const payload = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
+    if (payload) opts.headers = {...opts.headers, 'Content-Length': Buffer.byteLength(payload)};
     const req = mod.request(opts, res => {
-      let data = '';
-      res.on('data', c => data += c);
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
       res.on('end', () => {
+        const data = Buffer.concat(chunks).toString('utf8');
         try { resolve({status: res.statusCode, data: JSON.parse(data)}); }
         catch { resolve({status: res.statusCode, data}); }
       });
     });
     req.on('error', reject);
-    if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
+    req.setTimeout(60000, () => req.destroy(new Error('Timeout HTTP: ' + parsed.hostname)));
+    if (payload) req.write(payload);
     req.end();
   });
 }
@@ -75,9 +177,11 @@ async function renovarTokenApresentame() {
   if (!r.data?.token) throw new Error('Falha ao renovar token Apresenta.me');
   apresentameToken = 'Bearer ' + r.data.token;
   apresentameTokenAt = Date.now();
-  // Persiste no config para sobreviver restart
-  CONFIG.apresentame.token = apresentameToken;
-  try { fs.writeFileSync(path.join(DIR, 'config.json'), JSON.stringify(CONFIG, null, 2), 'utf8'); } catch {}
+  // Persiste no config para sobreviver restart (só no modo serviço com config.json)
+  if (HAS_CONFIG_FILE && !RUN_ONCE) {
+    CONFIG.apresentame.token = apresentameToken;
+    try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(CONFIG, null, 2), 'utf8'); } catch {}
+  }
   console.log('[APRESENTAME] Token renovado');
 }
 
@@ -379,6 +483,7 @@ async function processFollowUp(dealId) {
 async function ciclo() {
   const ts = new Date().toISOString().replace('T',' ').substring(0,19);
   console.log(`\n[${ts}] === CICLO INICIADO ===`);
+  let ok = true;
 
   try {
     const allDeals = await fetchAllDeals();
@@ -440,29 +545,41 @@ async function ciclo() {
     }
 
   } catch(e) {
+    ok = false;
     console.error('[CICLO ERRO]', e.message);
   }
 
-  const prox = new Date(Date.now() + CONFIG.intervaloMinutos * 60000).toLocaleTimeString('pt-BR', {timeZone: 'America/Sao_Paulo'});
-  console.log(`  Próximo ciclo: ${prox}`);
+  if (!RUN_ONCE) {
+    const prox = new Date(Date.now() + CONFIG.intervaloMinutos * 60000).toLocaleTimeString('pt-BR', {timeZone: 'America/Sao_Paulo'});
+    console.log(`  Próximo ciclo: ${prox}`);
+  }
+  return ok;
 }
 
 // ---- Utilitário ----
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ---- Inicialização ----
-loadState();
-Promise.all([renovarTokenApresentame(), clikLogin()]).then(() => {
+async function main() {
+  console.log(RUN_ONCE ? 'Robô Sam Dias: execução única.' : 'Robô Sam Dias iniciado. Ctrl+C para encerrar.');
+  await loadState();
+  await Promise.all([renovarTokenApresentame(), clikLogin()]);
+
+  if (RUN_ONCE) {
+    const ok = await ciclo();
+    await saveChain; // garante que o estado foi gravado antes de sair
+    process.exit(ok ? 0 : 1);
+  }
+
   ciclo();
   setInterval(ciclo, CONFIG.intervaloMinutos * 60000);
   // Renova token Apresenta.me a cada 9h (expira em 10h)
   setInterval(() => renovarTokenApresentame().catch(console.error), 9 * 3600000);
-}).catch(e => {
+  // Renova token Clikchat a cada 20h
+  setInterval(() => clikLogin().catch(console.error), 20 * 3600000);
+}
+
+main().catch(e => {
   console.error('Falha ao iniciar:', e.message);
   process.exit(1);
 });
-
-// Renova token Clikchat a cada 20h
-setInterval(() => clikLogin().catch(console.error), 20 * 3600000);
-
-console.log('Robô Sam Dias iniciado. Ctrl+C para encerrar.');
