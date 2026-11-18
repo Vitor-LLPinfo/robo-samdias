@@ -1,0 +1,21 @@
+{
+  "apresentame": {
+    "baseUrl": "https://api.apresenta.me",
+    "email": "SEU_EMAIL",
+    "password": "SUA_SENHA",
+    "companyId": 0,
+    "token": "COLE_SEU_TOKEN_AQUI",
+    "stepLead": 0,
+    "stepFollowUp": 0,
+    "stepAtendimento": 0
+  },
+  "clikchat": {
+    "email": "SEU_EMAIL",
+    "password": "SUA_SENHA",
+    "whatsappId": 0
+  },
+  "fusoHorario": -3,
+  "horarioInicio": 8,
+  "horarioFim": 18,
+  "intervaloMinutos": 15
+}
