@@ -36,3 +36,21 @@ sudo journalctl -u robo-samdias -f   # logs
 ```
 
 > ⚠️ `config.json` contém senhas — nunca faça commit dele.
+
+## Rodar no Azure (Container App Job)
+A imagem `ghcr.io/vitor-llpinfo/robo-samdias:latest` é gerada pela GitHub Action `.github/workflows/imagem.yml` a cada push na `main`.
+No container o robô roda **um ciclo e encerra** (`RUN_ONCE=1`); o agendamento é do Container App Job.
+
+Configuração por variáveis de ambiente (senhas como *secrets* do job):
+
+| Variável | Corresponde a |
+|---|---|
+| `APRESENTAME_EMAIL`, `APRESENTAME_PASSWORD` | `apresentame.email` / `password` |
+| `APRESENTAME_COMPANY_ID` | `apresentame.companyId` |
+| `APRESENTAME_STEP_LEAD`, `APRESENTAME_STEP_FOLLOWUP`, `APRESENTAME_STEP_ATENDIMENTO` | IDs das etapas do funil |
+| `CLIKCHAT_EMAIL`, `CLIKCHAT_PASSWORD`, `CLIKCHAT_WHATSAPP_ID` | `clikchat.*` |
+| `HORARIO_INICIO`, `HORARIO_FIM`, `FUSO_HORARIO` | horário comercial (padrão 8–18, -3) |
+| `STATE_BLOB_URL` | URL do blob de estado, ex.: `https://samdiasarquivos.blob.core.windows.net/robo-samdias/estado.json` |
+
+O estado é lido/gravado no blob com a **identidade gerenciada** do job (papel *Storage Blob Data Contributor* no container `robo-samdias`) — sem chaves.
+Se o blob não puder ser lido, o ciclo é abortado para não reenviar mensagens.
